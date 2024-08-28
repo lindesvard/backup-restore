@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# Configuration
+# Load environment variables from .env file
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+else
+    echo "Error: .env file not found in the current directory."
+    exit 1
+fi
+
+# Use environment variables
+AWS_BUCKET_NAME="${AWS_BUCKET_NAME}"
+AWS_BUCKET_PATH="${AWS_BUCKET_PATH}/redis"
+BACKUP_DIR="${BACKUP_DIR:-backups}"
+
+# Redis password (set this before running the script)
+# export REDIS_PASSWORD="your_redis_password"
+
+# Function to get container ID from name
+get_container_id() {
+    local container_name="$1"
+    local container_id=$(docker ps -qf "name=^/${container_name}$")
+    if [ -z "$container_id" ]; then
+        echo "Error: No running container found with name $container_name" >&2
+        exit 1
+    fi
+    echo "$container_id"
+}
+
+# Function to execute Redis CLI command
+redis_cli_cmd() {
+    local container_id="$1"
+    local cmd="$2"
+    local output
+    if [ -n "$REDIS_PASSWORD" ]; then
+        output=$(docker exec $container_id redis-cli -a "$REDIS_PASSWORD" $cmd 2>&1)
+    else
+        output=$(docker exec $container_id redis-cli $cmd 2>&1)
+    fi
+
+    if [[ $output == *"NOAUTH Authentication required"* ]]; then
+        echo "Error: NOAUTH Authentication required. Please set the REDIS_PASSWORD environment variable."
+        exit 1
+    elif [[ $output =~ OK$ ]]; then
+        echo "Output: $output"
+        echo ""
+        echo "Redis database saved successfully."
+    else
+        if [[ $output =~ ^Warning ]]; then
+            echo "Warning encountered: $output"
+            echo "Command execution continued despite warning."
+        else
+            echo "Failed to execute command \"redis-cli $cmd\""
+            echo "Output: $output"
+            exit 1
+        fi
+    fi
+
+    echo "$output"
+}
+
+# Function to backup Redis database
+backup_database() {
+    local container_name="$1"
+    local container_id=$(get_container_id "$container_name")
+    local timestamp=$(date '+%Y-%m-%d-%H-%M')
+    local filename="redis_dump_${timestamp}.rdb"
+    local backup_file="${BACKUP_DIR}/${filename}"
+
+    echo "Backing up Redis database from container: $container_name (ID: $container_id)"
+    redis_cli_cmd $container_id save
+    docker cp $container_id:/data/dump.rdb "$backup_file"
+    
+    if [ $? -eq 0 ]; then
+        echo "Backup created successfully: $backup_file"
+        push_to_s3 "$backup_file" "$filename"
+    else
+        echo "Backup failed"
+        exit 1
+    fi
+}
+
+# Function to push backup to S3
+push_to_s3() {
+    local local_file="$1"
+    local s3_file="$2"
+    echo "Pushing $local_file to S3 bucket: $AWS_BUCKET_NAME/$AWS_BUCKET_PATH/$s3_file"
+    aws s3 cp "$local_file" "s3://$AWS_BUCKET_NAME/$AWS_BUCKET_PATH/$s3_file"
+    
+    if [ $? -eq 0 ]; then
+        echo "File uploaded successfully to S3"
+    else
+        echo "S3 upload failed"
+        exit 1
+    fi
+}
+
+# Function to restore Redis database
+restore_database() {
+    local container_name="$1"
+    local container_id=$(get_container_id "$container_name")
+    local backup_file="$2"
+
+    # Validate backup file
+    if [ ! -f "$backup_file" ]; then
+        echo "Error: Backup file '$backup_file' not found."
+        exit 1
+    fi
+
+    echo "Backup file validated successfully."
+
+    echo ""
+    echo "========================================================"
+    echo ""
+    echo "WARNING: You are about to restore the Redis database in container '$container_name'."
+    echo ""
+    echo "Container details:"
+    docker ps --filter "name=$container_name" --format "{{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}"
+    echo ""
+    echo "This action will overwrite the existing data."
+    echo ""
+    read -p "Are you sure you want to proceed? (yes/no): " confirm
+
+    if [[ $confirm != "yes" ]]; then
+        echo "Database restoration cancelled."
+        exit 0
+    fi
+
+    echo "Restoring Redis database in container: $container_name (ID: $container_id)"
+    
+    # Stop Redis server
+    redis_cli_cmd $container_id shutdown
+
+    # Copy the backup file to the container
+    docker cp "$backup_file" $container_id:/data/dump.rdb
+
+    # Start Redis server
+    docker start $container_id
+
+    if [ $? -eq 0 ]; then
+        echo "Redis database restored successfully"
+    else
+        echo "Restoration failed"
+        exit 1
+    fi
+}
+
+# Function to download backup from S3
+download_from_s3() {
+    local s3_file="$1"
+    local local_file="$2"
+    echo "Downloading $s3_file from S3 bucket: $AWS_BUCKET_NAME/$AWS_BUCKET_PATH"
+    aws s3 cp "s3://$AWS_BUCKET_NAME/$AWS_BUCKET_PATH/$s3_file" "$local_file"
+    
+    if [ $? -eq 0 ]; then
+        echo "File downloaded successfully from S3"
+    else
+        echo "S3 download failed"
+        exit 1
+    fi
+}
+
+# Check if REDIS_PASSWORD is set
+if [ -z "$REDIS_PASSWORD" ]; then
+    echo "Warning: REDIS_PASSWORD environment variable is not set."
+    echo "Proceeding without authentication. Set REDIS_PASSWORD if your Redis instance requires authentication."
+    echo ""
+fi
+
+# Main execution
+case "$1" in
+    backup)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 backup <container_name>"
+            exit 1
+        fi
+        backup_database "$2"
+        ;;
+    restore)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo "Usage: $0 restore <container_name> <backup_file>"
+            exit 1
+        fi
+        if [[ "$3" == s3://* ]]; then
+            local_file="${BACKUP_DIR}/$(basename "$3")"
+            download_from_s3 "$(basename "$3")" "$local_file"
+            restore_database "$2" "$local_file"
+        else
+            restore_database "$2" "$3"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {backup|restore} ..."
+        exit 1
+        ;;
+esac
